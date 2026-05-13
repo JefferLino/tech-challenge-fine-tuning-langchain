@@ -13,13 +13,15 @@ import torch
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer, SFTConfig
 
 from config import (
     MODEL_NAME, OUTPUT_DIR, PROCESSED_DATA,
     BATCH_SIZE, GRAD_ACCUM, EPOCHS, LR,
     LORA_R, LORA_ALPHA, LORA_DROPOUT, TARGET_MODULES,
 )
+
+
+MIN_TRAIN_VRAM_GB = 6.0
 
 
 def load_dataset(path: str) -> Dataset:
@@ -48,7 +50,33 @@ def build_lora_config() -> LoraConfig:
     )
 
 
+def validate_training_environment() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Treino QLoRA requer PyTorch com CUDA ativo. "
+            f"Ambiente atual: torch {torch.__version__}, "
+            "torch.cuda.is_available()=False. "
+            "Para esta maquina, use a inferencia com Ollama (`python inference.py`) "
+            "ou treine em uma GPU NVIDIA com pelo menos 6 GB de VRAM."
+        )
+
+    props = torch.cuda.get_device_properties(0)
+    total_vram_gb = props.total_memory / 1024**3
+    if total_vram_gb < MIN_TRAIN_VRAM_GB:
+        raise RuntimeError(
+            f"GPU detectada: {torch.cuda.get_device_name(0)} "
+            f"com {total_vram_gb:.1f} GB de VRAM. "
+            f"O treino QLoRA deste projeto precisa de pelo menos "
+            f"{MIN_TRAIN_VRAM_GB:.0f} GB. "
+            "Use Colab/Kaggle/VM com GPU maior para treinar, e Ollama "
+            "para inferencia local nesta maquina."
+        )
+
+
 def train():
+    validate_training_environment()
+    from trl import SFTConfig, SFTTrainer
+
     print("[train] Carregando dataset...")
     dataset = load_dataset(PROCESSED_DATA)
     print(f"[train] {len(dataset)} exemplos carregados.")

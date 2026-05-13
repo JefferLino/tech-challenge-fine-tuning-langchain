@@ -7,11 +7,24 @@ Uso:
     python inference.py
 """
 
+from typing import Optional
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
 
 from config import MODEL_NAME, OUTPUT_DIR
+from logs import (
+    add_explainability_to_answer,
+    elapsed_seconds,
+    log_audit_event,
+    log_explainability,
+    log_service_call,
+    log_service_error,
+    new_trace_id,
+    setup_logging,
+    start_timer,
+)
 
 
 def build_bnb_config() -> BitsAndBytesConfig:
@@ -24,6 +37,12 @@ def build_bnb_config() -> BitsAndBytesConfig:
 
 
 def load_model():
+    setup_logging()
+    log_audit_event(
+        event="model_load_started",
+        metadata={"model_name": MODEL_NAME, "output_dir": OUTPUT_DIR},
+    )
+
     print("[inference] Carregando tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.pad_token = tokenizer.eos_token
@@ -39,10 +58,22 @@ def load_model():
     model = PeftModel.from_pretrained(base_model, OUTPUT_DIR)
     model.eval()
 
+    log_audit_event(
+        event="model_load_finished",
+        metadata={"model_name": MODEL_NAME, "output_dir": OUTPUT_DIR},
+    )
+
     return model, tokenizer
 
 
-def call_initial_prompt(model, tokenizer, question: str, context: str = "") -> str:
+def call_initial_prompt(
+    model,
+    tokenizer,
+    question: str,
+    context: str = "",
+    trace_id: Optional[str] = None,
+    source: str = "",
+) -> str:
     context_block = f"Contexto:\n{context}\n\n" if context.strip() else ""
 
     prompt = (
@@ -64,20 +95,67 @@ def call_initial_prompt(model, tokenizer, question: str, context: str = "") -> s
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.7,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
+    generation_params = {
+        "max_new_tokens": 256,
+        "temperature": 0.7,
+        "do_sample": True,
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+
+    started_at = start_timer()
+    try:
+        with torch.no_grad():
+            output_ids = model.generate(**inputs, **generation_params)
+    except Exception as error:
+        log_service_error(
+            service_name="initial_prompt",
+            question=question,
+            error=error,
+            context=context,
+            trace_id=trace_id,
+            source=source,
         )
+        raise
+    duration = elapsed_seconds(started_at)
 
     generated = output_ids[0][input_len:]
-    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+    answer = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    log_service_call(
+        service_name="initial_prompt",
+        question=question,
+        prompt=prompt,
+        response=answer,
+        context=context,
+        trace_id=trace_id,
+        generation_params=generation_params,
+        duration_seconds=duration,
+        source=source,
+        metadata={
+            "input_tokens": input_len,
+            "output_tokens": len(generated),
+        },
+    )
+    log_explainability(
+        service_name="initial_prompt",
+        question=question,
+        answer=answer,
+        context=context,
+        trace_id=trace_id,
+        source=source,
+    )
+    return answer
 
 
-def call_evaluation_prompt(model, tokenizer, question: str, answer: str, context: str = "") -> str:
+def call_evaluation_prompt(
+    model,
+    tokenizer,
+    question: str,
+    answer: str,
+    context: str = "",
+    trace_id: Optional[str] = None,
+    attempt: Optional[int] = None,
+    source: str = "",
+) -> str:
     context_block = f"Contexto:\n{context}\n\n" if context.strip() else ""
 
     prompt = (
@@ -105,16 +183,57 @@ def call_evaluation_prompt(model, tokenizer, question: str, answer: str, context
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=160,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
+    generation_params = {
+        "max_new_tokens": 160,
+        "do_sample": False,
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+
+    started_at = start_timer()
+    try:
+        with torch.no_grad():
+            output_ids = model.generate(**inputs, **generation_params)
+    except Exception as error:
+        log_service_error(
+            service_name="evaluation_prompt",
+            question=question,
+            error=error,
+            context=context,
+            trace_id=trace_id,
+            metadata={"attempt": attempt},
+            source=source,
         )
+        raise
+    duration = elapsed_seconds(started_at)
 
     generated = output_ids[0][input_len:]
-    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+    evaluation = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    log_service_call(
+        service_name="evaluation_prompt",
+        question=question,
+        prompt=prompt,
+        response=evaluation,
+        context=context,
+        trace_id=trace_id,
+        generation_params=generation_params,
+        duration_seconds=duration,
+        source=source,
+        metadata={
+            "attempt": attempt,
+            "input_tokens": input_len,
+            "output_tokens": len(generated),
+        },
+    )
+    log_explainability(
+        service_name="evaluation_prompt",
+        question=question,
+        answer=evaluation,
+        context=context,
+        trace_id=trace_id,
+        source=source,
+        metadata={"attempt": attempt},
+    )
+    return evaluation
 
 
 def call_revision_prompt(
@@ -124,6 +243,9 @@ def call_revision_prompt(
     answer: str,
     evaluation: str,
     context: str = "",
+    trace_id: Optional[str] = None,
+    attempt: Optional[int] = None,
+    source: str = "",
 ) -> str:
     context_block = f"Contexto:\n{context}\n\n" if context.strip() else ""
 
@@ -149,36 +271,125 @@ def call_revision_prompt(
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.7,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
+    generation_params = {
+        "max_new_tokens": 256,
+        "temperature": 0.7,
+        "do_sample": True,
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+
+    started_at = start_timer()
+    try:
+        with torch.no_grad():
+            output_ids = model.generate(**inputs, **generation_params)
+    except Exception as error:
+        log_service_error(
+            service_name="revision_prompt",
+            question=question,
+            error=error,
+            context=context,
+            trace_id=trace_id,
+            metadata={"attempt": attempt},
+            source=source,
         )
+        raise
+    duration = elapsed_seconds(started_at)
 
     generated = output_ids[0][input_len:]
-    return tokenizer.decode(generated, skip_special_tokens=True).strip()
+    revised_answer = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    log_service_call(
+        service_name="revision_prompt",
+        question=question,
+        prompt=prompt,
+        response=revised_answer,
+        context=context,
+        trace_id=trace_id,
+        generation_params=generation_params,
+        duration_seconds=duration,
+        source=source,
+        metadata={
+            "attempt": attempt,
+            "input_tokens": input_len,
+            "output_tokens": len(generated),
+        },
+    )
+    log_explainability(
+        service_name="revision_prompt",
+        question=question,
+        answer=revised_answer,
+        context=context,
+        trace_id=trace_id,
+        source=source,
+        metadata={"attempt": attempt},
+    )
+    return revised_answer
 
 
-def ask(model, tokenizer, question: str, context: str = "") -> str:
-    answer = call_initial_prompt(model, tokenizer, question, context)
+def ask(model, tokenizer, question: str, context: str = "", source: str = "") -> str:
+    trace_id = new_trace_id()
+    log_audit_event(
+        event="ask_started",
+        trace_id=trace_id,
+        metadata={"has_context": bool(context.strip())},
+    )
+
+    answer = call_initial_prompt(model, tokenizer, question, context, trace_id=trace_id, source=source)
     last_evaluation = ""
+    verdict = ""
 
     for attempt in range(3):
-        last_evaluation = call_evaluation_prompt(model, tokenizer, question, answer, context)
+        attempt_number = attempt + 1
+        last_evaluation = call_evaluation_prompt(
+            model,
+            tokenizer,
+            question,
+            answer,
+            context,
+            trace_id=trace_id,
+            attempt=attempt_number,
+            source=source,
+        )
         evaluation_lines = [line.strip().upper() for line in last_evaluation.splitlines() if line.strip()]
         verdict_line = next((line for line in evaluation_lines if line.startswith("PARECER:")), "")
         verdict = verdict_line.split(":", 1)[-1].strip().strip(".") if verdict_line else ""
+        log_audit_event(
+            event="evaluation_verdict",
+            trace_id=trace_id,
+            metadata={"attempt": attempt_number, "verdict": verdict or "INDEFINIDO"},
+        )
 
         if verdict == "APROVADO":
-            return answer
+            final_answer = add_explainability_to_answer(answer, context=context, source=source)
+            log_explainability(
+                service_name="final_answer",
+                question=question,
+                answer=final_answer,
+                context=context,
+                trace_id=trace_id,
+                source=source,
+                metadata={"status": "approved", "attempt": attempt_number},
+            )
+            log_audit_event(
+                event="ask_finished",
+                trace_id=trace_id,
+                metadata={"status": "approved", "attempt": attempt_number},
+            )
+            return final_answer
 
         if attempt < 2:
-            answer = call_revision_prompt(model, tokenizer, question, answer, last_evaluation, context)
+            answer = call_revision_prompt(
+                model,
+                tokenizer,
+                question,
+                answer,
+                last_evaluation,
+                context,
+                trace_id=trace_id,
+                attempt=attempt_number,
+                source=source,
+            )
 
-    return (
+    final_answer = (
         "Não foi possível gerar uma resposta aprovada pelos critérios de segurança e qualidade após "
         "3 tentativas. Recomenda-se consultar um profissional de saúde qualificado para avaliar o caso.\n\n"
         "Resumo:\n"
@@ -186,6 +397,22 @@ def ask(model, tokenizer, question: str, context: str = "") -> str:
         "- Não foram exibidas orientações potencialmente inadequadas.\n"
         "- O fluxo chegou ao limite de 3 avaliações sem aprovação."
     )
+    final_answer = add_explainability_to_answer(final_answer, context=context, source=source)
+    log_explainability(
+        service_name="final_answer",
+        question=question,
+        answer=final_answer,
+        context=context,
+        trace_id=trace_id,
+        source=source,
+        metadata={"status": "rejected", "last_verdict": verdict or "INDEFINIDO"},
+    )
+    log_audit_event(
+        event="ask_finished",
+        trace_id=trace_id,
+        metadata={"status": "rejected", "last_verdict": verdict or "INDEFINIDO"},
+    )
+    return final_answer
 
 
 def main():

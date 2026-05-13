@@ -3,11 +3,6 @@ inference.py
 ------------
 Carrega o modelo base + adaptadores LoRA e responde perguntas medicas.
 
-O fluxo de inferencia usa LangChain em tres etapas:
-1. geracao inicial da resposta;
-2. avaliacao critica da resposta;
-3. formatacao final em bullets com fontes e ressalvas.
-
 Uso:
     python inference.py
 """
@@ -19,7 +14,6 @@ import os
 import re
 import time
 import unicodedata
-from datetime import datetime
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -37,6 +31,11 @@ from config import (
     OLLAMA_MODEL,
     OUTPUT_DIR,
 )
+from session_log import (
+    append_session_log,
+    close_session_log,
+    create_session_log_file,
+)
 
 try:
     from langchain_core.prompts import PromptTemplate
@@ -48,10 +47,10 @@ except ImportError:
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_FILE = LOG_DIR / "inference_audit.log"
-SESSION_LOG_DIR = LOG_DIR / "sessions"
 ADAPTER_CONFIG_NAME = "adapter_config.json"
 VALID_BACKENDS = {"auto", "ollama", "hf"}
 MIN_CUDA_4BIT_VRAM_GB = float(os.getenv("HF_4BIT_MIN_VRAM_GB", "4"))
+SESSION_LOG_PATH: Path | None = None
 DEFAULT_CPU_MAX_MEMORY = os.getenv("HF_CPU_MAX_MEMORY", "12GiB")
 AUDIT_FULL_TEXT = os.getenv("AUDIT_FULL_TEXT", "0").lower() in {"1", "true", "yes"}
 SENSITIVE_LOG_FIELDS = {
@@ -266,37 +265,9 @@ def _redact_or_hash(text: str) -> dict:
     return payload
 
 
-def _create_session_log_file() -> Path:
-    SESSION_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    session_file = SESSION_LOG_DIR / (
-        f"session_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:8]}.txt"
-    )
-    with session_file.open("w", encoding="utf-8") as handle:
-        handle.write(
-            "Sessao iniciada: "
-            f"{datetime.now():%Y-%m-%d %H:%M:%S}\n"
-        )
-        handle.write("=== Registro de sessao ===\n\n")
-    return session_file
-
-
-def _append_session_log(session_log_path: Path, label: str, content: str) -> None:
-    with session_log_path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            f"--- {datetime.now():%Y-%m-%d %H:%M:%S} - {label} ---\n"
-        )
-        handle.write(content.rstrip() + "\n\n")
-
-
-def _close_session_log(session_log_path: Path) -> None:
-    with session_log_path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            "Sessao finalizada: "
-            f"{datetime.now():%Y-%m-%d %H:%M:%S}\n"
-        )
-
-
 def audit_event(event: str, request_id=None, **fields) -> None:
+    global SESSION_LOG_PATH
+
     payload = {
         "event": event,
         "request_id": request_id,
@@ -311,18 +282,12 @@ def audit_event(event: str, request_id=None, **fields) -> None:
 
     LOGGER.info(json.dumps(payload, ensure_ascii=False, default=str))
 
-
-def require_langchain() -> None:
-    if PromptTemplate is None or RunnableLambda is None:
-        raise RuntimeError(
-            "LangChain nao esta instalado. Execute `pip install -r requirements.txt` "
-            "dentro da pasta fine-tuning-langchain antes de rodar a inferencia."
+    if SESSION_LOG_PATH is not None:
+        append_session_log(
+            SESSION_LOG_PATH,
+            f"Audit: {event}",
+            json.dumps(payload, ensure_ascii=False, default=str, indent=2),
         )
-
-
-class OllamaUnavailable(RuntimeError):
-    """Falha esperada ao tentar usar um servidor Ollama local."""
-
 
 class OllamaModel:
     backend = "ollama"
@@ -424,11 +389,8 @@ def _ollama_request(
             body = response.read().decode("utf-8")
     except urlerror.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise OllamaUnavailable(f"Ollama retornou HTTP {exc.code}: {detail}") from exc
     except (OSError, TimeoutError, urlerror.URLError) as exc:
-        raise OllamaUnavailable(
-            f"Ollama indisponivel em {host}. Inicie com `ollama serve`."
-        ) from exc
+        raise exc
 
     if not body:
         return {}
@@ -436,7 +398,7 @@ def _ollama_request(
     try:
         return json.loads(body)
     except json.JSONDecodeError as exc:
-        raise OllamaUnavailable("Ollama retornou uma resposta invalida.") from exc
+        raise exc
 
 
 def _list_ollama_models(host: str) -> list[str]:
@@ -759,7 +721,6 @@ def _detect_guardrail_findings(answer: str) -> str:
 
 
 def _prompt(template: str, **kwargs) -> str:
-    require_langchain()
     return PromptTemplate.from_template(template).format(**kwargs)
 
 
@@ -1038,11 +999,12 @@ def ask(
 
     question = question.strip()
     context = context.strip()
+    session_log_path = session_log_path or SESSION_LOG_PATH
 
     if session_log_path is not None:
-        _append_session_log(session_log_path, "Pergunta", question)
+        append_session_log(session_log_path, "Pergunta", question)
         if context:
-            _append_session_log(session_log_path, "Contexto", context)
+            append_session_log(session_log_path, "Contexto", context)
 
     prompt, initial_answer = _build_initial_answer(model, tokenizer, question, context)
     audit_event(
@@ -1056,8 +1018,8 @@ def ask(
         answer=initial_answer,
     )
     if session_log_path is not None:
-        _append_session_log(session_log_path, "Prompt inicial", prompt)
-        _append_session_log(session_log_path, "Resposta inicial", initial_answer)
+        append_session_log(session_log_path, "Prompt inicial", prompt)
+        append_session_log(session_log_path, "Resposta inicial", initial_answer)
 
     evaluation_prompt, evaluation = _build_evaluation(
         model,
@@ -1077,8 +1039,8 @@ def ask(
         evaluation=evaluation,
     )
     if session_log_path is not None:
-        _append_session_log(session_log_path, "Prompt de avaliacao", evaluation_prompt)
-        _append_session_log(session_log_path, "Avaliacao", evaluation)
+        append_session_log(session_log_path, "Prompt de avaliacao", evaluation_prompt)
+        append_session_log(session_log_path, "Avaliacao", evaluation)
 
     attempt = 1
     while not _is_evaluation_approved(evaluation) and attempt < MAX_EVALUATION_ATTEMPTS:
@@ -1103,9 +1065,8 @@ def ask(
             attempt=attempt,
         )
         if session_log_path is not None:
-            _append_session_log(session_log_path, f"Prompt de revisao (tentativa {attempt})", revision_prompt)
-            _append_session_log(session_log_path, f"Resposta revisada (tentativa {attempt})", revised_answer)
-
+            append_session_log(session_log_path, f"Prompt de revisao (tentativa {attempt})", revision_prompt)
+            append_session_log(session_log_path, f"Resposta revisada (tentativa {attempt})", revised_answer)
         initial_answer = revised_answer
         evaluation_prompt, evaluation = _build_evaluation(
             model,
@@ -1127,8 +1088,8 @@ def ask(
             attempt=attempt,
         )
         if session_log_path is not None:
-            _append_session_log(session_log_path, f"Prompt de reavaliacao (tentativa {attempt})", evaluation_prompt)
-            _append_session_log(session_log_path, f"Reavaliacao (tentativa {attempt})", evaluation)
+            append_session_log(session_log_path, f"Prompt de reavaliacao (tentativa {attempt})", evaluation_prompt)
+            append_session_log(session_log_path, f"Reavaliacao (tentativa {attempt})", evaluation)
 
     final_prompt, final_answer = _build_final_summary(model, tokenizer, question, context)
     audit_event(
@@ -1137,8 +1098,8 @@ def ask(
         final_answer=final_answer,
     )
     if session_log_path is not None:
-        _append_session_log(session_log_path, "Prompt final de resumo", final_prompt)
-        _append_session_log(session_log_path, "Resposta final", final_answer)
+        append_session_log(session_log_path, "Prompt final de resumo", final_prompt)
+        append_session_log(session_log_path, "Resposta final", final_answer)
 
     audit_event(
         "request_finished",
@@ -1153,8 +1114,10 @@ def ask(
 
 
 def main():
+    global SESSION_LOG_PATH
+    SESSION_LOG_PATH = create_session_log_file()
+    session_log_path = SESSION_LOG_PATH
     model, tokenizer = load_model()
-    session_log_path = _create_session_log_file()
 
     print("\n=== Assistente Medico (digite 'sair' para encerrar) ===\n")
     while True:
@@ -1168,7 +1131,7 @@ def main():
         resposta = ask(model, tokenizer, question, context, session_log_path=session_log_path)
         print(f"\nResposta:\n{resposta}\n")
 
-    _close_session_log(session_log_path)
+    close_session_log(session_log_path)
 
 
 if __name__ == "__main__":

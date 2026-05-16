@@ -7,11 +7,13 @@ Uso:
     python inference.py
 """
 
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from langchain_core.prompts import PromptTemplate
+from langchain_huggingface.llms import HuggingFacePipeline
 from peft import PeftModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline as transformers_pipeline
 
 from config import MODEL_NAME, OUTPUT_DIR
 from logs import (
@@ -25,6 +27,9 @@ from logs import (
     setup_logging,
     start_timer,
 )
+
+
+LANGCHAIN_PROMPT = PromptTemplate.from_template("{prompt}")
 
 
 def build_bnb_config() -> BitsAndBytesConfig:
@@ -66,6 +71,23 @@ def load_model():
     return model, tokenizer
 
 
+def count_tokens(tokenizer, text: str, add_special_tokens: bool = True) -> int:
+    return len(tokenizer(text or "", add_special_tokens=add_special_tokens)["input_ids"])
+
+
+def generate_with_langchain(model, tokenizer, prompt: str, generation_params: Dict[str, object]) -> str:
+    text_generation_pipeline = transformers_pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+    )
+    llm = HuggingFacePipeline(pipeline=text_generation_pipeline)
+    chain = LANGCHAIN_PROMPT | llm.bind(
+        pipeline_kwargs={**generation_params, "return_full_text": False},
+    )
+    return chain.invoke({"prompt": prompt}).strip()
+
+
 def call_initial_prompt(
     model,
     tokenizer,
@@ -92,9 +114,6 @@ def call_initial_prompt(
         "<|assistant|>\n"
     )
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len = inputs["input_ids"].shape[1]
-
     generation_params = {
         "max_new_tokens": 256,
         "temperature": 0.7,
@@ -102,10 +121,10 @@ def call_initial_prompt(
         "pad_token_id": tokenizer.eos_token_id,
     }
 
+    input_tokens = count_tokens(tokenizer, prompt)
     started_at = start_timer()
     try:
-        with torch.no_grad():
-            output_ids = model.generate(**inputs, **generation_params)
+        answer = generate_with_langchain(model, tokenizer, prompt, generation_params)
     except Exception as error:
         log_service_error(
             service_name="initial_prompt",
@@ -117,9 +136,7 @@ def call_initial_prompt(
         )
         raise
     duration = elapsed_seconds(started_at)
-
-    generated = output_ids[0][input_len:]
-    answer = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    output_tokens = count_tokens(tokenizer, answer, add_special_tokens=False)
     log_service_call(
         service_name="initial_prompt",
         question=question,
@@ -131,8 +148,8 @@ def call_initial_prompt(
         duration_seconds=duration,
         source=source,
         metadata={
-            "input_tokens": input_len,
-            "output_tokens": len(generated),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         },
     )
     log_explainability(
@@ -180,19 +197,16 @@ def call_evaluation_prompt(
         "<|assistant|>\n"
     )
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len = inputs["input_ids"].shape[1]
-
     generation_params = {
         "max_new_tokens": 160,
         "do_sample": False,
         "pad_token_id": tokenizer.eos_token_id,
     }
 
+    input_tokens = count_tokens(tokenizer, prompt)
     started_at = start_timer()
     try:
-        with torch.no_grad():
-            output_ids = model.generate(**inputs, **generation_params)
+        evaluation = generate_with_langchain(model, tokenizer, prompt, generation_params)
     except Exception as error:
         log_service_error(
             service_name="evaluation_prompt",
@@ -205,9 +219,7 @@ def call_evaluation_prompt(
         )
         raise
     duration = elapsed_seconds(started_at)
-
-    generated = output_ids[0][input_len:]
-    evaluation = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    output_tokens = count_tokens(tokenizer, evaluation, add_special_tokens=False)
     log_service_call(
         service_name="evaluation_prompt",
         question=question,
@@ -220,8 +232,8 @@ def call_evaluation_prompt(
         source=source,
         metadata={
             "attempt": attempt,
-            "input_tokens": input_len,
-            "output_tokens": len(generated),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         },
     )
     log_explainability(
@@ -268,9 +280,6 @@ def call_revision_prompt(
         "<|assistant|>\n"
     )
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len = inputs["input_ids"].shape[1]
-
     generation_params = {
         "max_new_tokens": 256,
         "temperature": 0.7,
@@ -278,10 +287,10 @@ def call_revision_prompt(
         "pad_token_id": tokenizer.eos_token_id,
     }
 
+    input_tokens = count_tokens(tokenizer, prompt)
     started_at = start_timer()
     try:
-        with torch.no_grad():
-            output_ids = model.generate(**inputs, **generation_params)
+        revised_answer = generate_with_langchain(model, tokenizer, prompt, generation_params)
     except Exception as error:
         log_service_error(
             service_name="revision_prompt",
@@ -294,9 +303,7 @@ def call_revision_prompt(
         )
         raise
     duration = elapsed_seconds(started_at)
-
-    generated = output_ids[0][input_len:]
-    revised_answer = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    output_tokens = count_tokens(tokenizer, revised_answer, add_special_tokens=False)
     log_service_call(
         service_name="revision_prompt",
         question=question,
@@ -309,8 +316,8 @@ def call_revision_prompt(
         source=source,
         metadata={
             "attempt": attempt,
-            "input_tokens": input_len,
-            "output_tokens": len(generated),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         },
     )
     log_explainability(

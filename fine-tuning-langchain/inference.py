@@ -7,14 +7,15 @@ Uso:
     python inference.py
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, TypedDict
 
 import torch
 from langchain_core.prompts import PromptTemplate
 from langchain_huggingface.llms import HuggingFacePipeline
+from langgraph.graph import END, StateGraph
 from peft import PeftModel
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline as transformers_pipeline
-
+from prontuario import buscar_prontuario_por_cpf, montar_contexto_prontuario, cpf_existe_no_prontuario
 from config import MODEL_NAME, OUTPUT_DIR
 from logs import (
     add_explainability_to_answer,
@@ -30,6 +31,21 @@ from logs import (
 
 
 LANGCHAIN_PROMPT = PromptTemplate.from_template("{prompt}")
+
+
+class MedicalAssistantState(TypedDict):
+    model: object
+    tokenizer: object
+    question: str
+    context: str
+    source: str
+    trace_id: str
+    answer: str
+    evaluation: str
+    verdict: str
+    attempt: int
+    final_answer: str
+    cpf: str
 
 
 def build_bnb_config() -> BitsAndBytesConfig:
@@ -86,7 +102,6 @@ def generate_with_langchain(model, tokenizer, prompt: str, generation_params: Di
         pipeline_kwargs={**generation_params, "return_full_text": False},
     )
     return chain.invoke({"prompt": prompt}).strip()
-
 
 def call_initial_prompt(
     model,
@@ -161,7 +176,6 @@ def call_initial_prompt(
         source=source,
     )
     return answer
-
 
 def call_evaluation_prompt(
     model,
@@ -332,7 +346,7 @@ def call_revision_prompt(
     return revised_answer
 
 
-def ask(model, tokenizer, question: str, context: str = "", source: str = "") -> str:
+def ask_without_langgraph(model, tokenizer, question: str, context: str = "", source: str = "") -> str:
     trace_id = new_trace_id()
     log_audit_event(
         event="ask_started",
@@ -357,6 +371,9 @@ def ask(model, tokenizer, question: str, context: str = "", source: str = "") ->
             source=source,
         )
         evaluation_lines = [line.strip().upper() for line in last_evaluation.splitlines() if line.strip()]
+        print("==========")
+        print(evaluation_lines)
+        print("==========")
         verdict_line = next((line for line in evaluation_lines if line.startswith("PARECER:")), "")
         verdict = verdict_line.split(":", 1)[-1].strip().strip(".") if verdict_line else ""
         log_audit_event(
@@ -395,15 +412,15 @@ def ask(model, tokenizer, question: str, context: str = "", source: str = "") ->
                 attempt=attempt_number,
                 source=source,
             )
-
-    final_answer = (
-        "Não foi possível gerar uma resposta aprovada pelos critérios de segurança e qualidade após "
-        "3 tentativas. Recomenda-se consultar um profissional de saúde qualificado para avaliar o caso.\n\n"
-        "Resumo:\n"
-        "- A resposta gerada não passou pela avaliação de segurança.\n"
-        "- Não foram exibidas orientações potencialmente inadequadas.\n"
-        "- O fluxo chegou ao limite de 3 avaliações sem aprovação."
-    )
+        else:
+            final_answer = (
+                "Não foi possível gerar uma resposta aprovada pelos critérios de segurança e qualidade após "
+                "3 tentativas. Recomenda-se consultar um profissional de saúde qualificado para avaliar o caso.\n\n"
+                "Resumo:\n"
+                "- A resposta gerada não passou pela avaliação de segurança.\n"
+                "- Não foram exibidas orientações potencialmente inadequadas.\n"
+                "- O fluxo chegou ao limite de 3 avaliações sem aprovação."
+            )
     final_answer = add_explainability_to_answer(final_answer, context=context, source=source)
     log_explainability(
         service_name="final_answer",
@@ -422,19 +439,229 @@ def ask(model, tokenizer, question: str, context: str = "", source: str = "") ->
     return final_answer
 
 
+def generate_initial_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
+    answer = call_initial_prompt(
+        state["model"],
+        state["tokenizer"],
+        state["question"],
+        state["context"],
+        trace_id=state["trace_id"],
+        source=state["source"],
+    )
+    return {**state, "answer": answer, "attempt": 1}
+
+
+def evaluate_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
+    evaluation = call_evaluation_prompt(
+        state["model"],
+        state["tokenizer"],
+        state["question"],
+        state["answer"],
+        state["context"],
+        trace_id=state["trace_id"],
+        attempt=state["attempt"],
+        source=state["source"],
+    )
+    evaluation_lines = [line.strip().upper() for line in evaluation.splitlines() if line.strip()]
+    verdict_line = next((line for line in evaluation_lines if line.startswith("PARECER:")), "")
+    verdict = verdict_line.split(":", 1)[-1].strip().strip(".") if verdict_line else ""
+
+    log_audit_event(
+        event="evaluation_verdict",
+        trace_id=state["trace_id"],
+        metadata={"attempt": state["attempt"], "verdict": verdict or "INDEFINIDO"},
+    )
+    return {**state, "evaluation": evaluation, "verdict": verdict}
+
+
+def revise_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
+    revised_answer = call_revision_prompt(
+        state["model"],
+        state["tokenizer"],
+        state["question"],
+        state["answer"],
+        state["evaluation"],
+        state["context"],
+        trace_id=state["trace_id"],
+        attempt=state["attempt"],
+        source=state["source"],
+    )
+    return {**state, "answer": revised_answer, "attempt": state["attempt"] + 1}
+
+
+def approve_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
+    final_answer = add_explainability_to_answer(
+        state["answer"],
+        context=state["context"],
+        source=state["source"],
+    )
+    log_explainability(
+        service_name="final_answer",
+        question=state["question"],
+        answer=final_answer,
+        context=state["context"],
+        trace_id=state["trace_id"],
+        source=state["source"],
+        metadata={"status": "approved", "attempt": state["attempt"]},
+    )
+    log_audit_event(
+        event="ask_finished",
+        trace_id=state["trace_id"],
+        metadata={"status": "approved", "attempt": state["attempt"]},
+    )
+    return {**state, "final_answer": final_answer}
+
+
+def reject_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
+    final_answer = (
+        "NÃ£o foi possÃ­vel gerar uma resposta aprovada pelos critÃ©rios de seguranÃ§a e qualidade apÃ³s "
+        "3 tentativas. Recomenda-se consultar um profissional de saÃºde qualificado para avaliar o caso.\n\n"
+        "Resumo:\n"
+        "- A resposta gerada nÃ£o passou pela avaliaÃ§Ã£o de seguranÃ§a.\n"
+        "- NÃ£o foram exibidas orientaÃ§Ãµes potencialmente inadequadas.\n"
+        "- O fluxo chegou ao limite de 3 avaliaÃ§Ãµes sem aprovaÃ§Ã£o."
+    )
+    final_answer = add_explainability_to_answer(
+        final_answer,
+        context=state["context"],
+        source=state["source"],
+    )
+    log_explainability(
+        service_name="final_answer",
+        question=state["question"],
+        answer=final_answer,
+        context=state["context"],
+        trace_id=state["trace_id"],
+        source=state["source"],
+        metadata={"status": "rejected", "last_verdict": state["verdict"] or "INDEFINIDO"},
+    )
+    log_audit_event(
+        event="ask_finished",
+        trace_id=state["trace_id"],
+        metadata={"status": "rejected", "last_verdict": state["verdict"] or "INDEFINIDO"},
+    )
+    return {**state, "final_answer": final_answer}
+
+
+def route_after_evaluation(state: MedicalAssistantState) -> str:
+    if state["verdict"] == "APROVADO":
+        return "approve"
+    if state["attempt"] >= 3:
+        return "reject"
+    return "revise"
+
+def route_prontuario(state: MedicalAssistantState) -> str:
+    if state["cpf"] == "":
+        return "question"
+    return "prontuario"
+
+
+def build_prontuario(state: MedicalAssistantState) -> MedicalAssistantState:
+    prontuario = buscar_prontuario_por_cpf(state["cpf"])
+    contexto_prontuario = montar_contexto_prontuario(prontuario)
+    contextos = [contexto_prontuario, state["context"]]
+    context = "\n\n".join(contexto.strip() for contexto in contextos if contexto and contexto.strip())
+
+    return {
+        **state,
+        "context": context,
+        "source": "base_mock_prontuarios.xlsx",
+    }
+
+
+def build_medical_assistant_graph():
+    graph = StateGraph(MedicalAssistantState)
+    
+    graph.add_node("generate_initial_answer", generate_initial_answer_node)
+    graph.add_node("evaluate_answer", evaluate_answer_node)
+    graph.add_node("revise_answer", revise_answer_node)
+    graph.add_node("approve_answer", approve_answer_node)
+    graph.add_node("reject_answer", reject_answer_node)
+    graph.add_node("build_prontuario", build_prontuario)
+
+    graph.set_conditional_entry_point(route_prontuario, {
+        "question" : "generate_initial_answer",
+        "prontuario" : "build_prontuario"
+    })
+    graph.add_edge("build_prontuario", "generate_initial_answer")
+    graph.add_edge("generate_initial_answer", "evaluate_answer")
+    graph.add_conditional_edges(
+        "evaluate_answer",
+        route_after_evaluation,
+        {
+            "approve": "approve_answer",
+            "revise": "revise_answer",
+            "reject": "reject_answer",
+        },
+    )
+    graph.add_edge("revise_answer", "evaluate_answer")
+    graph.add_edge("approve_answer", END)
+    graph.add_edge("reject_answer", END)
+
+    return graph.compile()
+
+
+def ask(model, tokenizer, question: str, context: str = "", source: str = "", cpf = "") -> str:
+    trace_id = new_trace_id()
+    log_audit_event(
+        event="ask_started",
+        trace_id=trace_id,
+        metadata={"has_context": bool(context.strip())},
+    )
+
+    app = build_medical_assistant_graph()
+
+    print(app.get_graph().draw_ascii())  
+
+    initial_state: MedicalAssistantState = {
+        "model": model,
+        "tokenizer": tokenizer,
+        "question": question,
+        "context": context,
+        "source": source,
+        "trace_id": trace_id,
+        "answer": "",
+        "evaluation": "",
+        "verdict": "",
+        "attempt": 0,
+        "final_answer": "",
+        "cpf" : cpf
+    }
+    final_state = app.invoke(initial_state)
+    return final_state["final_answer"]
+
+
 def main():
     model, tokenizer = load_model()
 
     print("\n=== Assistente Médico (digite 'sair' para encerrar) ===\n")
     while True:
-        question = input("Pergunta: ").strip()
-        if question.lower() in {"sair", "exit", "quit"}:
-            break
-        if not question:
-            continue
+        cpf = input("Informar o CPF para busca de prontuario (opcional): ").strip()
+        question = ""
+        context = ""
 
-        context = input("Contexto (opcional, Enter para pular): ").strip()
-        resposta = ask(model, tokenizer, question, context)
+        if cpf:
+            existe_cpf = cpf_existe_no_prontuario(cpf)
+            if (not existe_cpf):
+                print("Paciente não encontrado")
+                continue
+            question = (
+                "Analise o prontuario do paciente com base nos atendimentos, internacoes e alergias "
+                "disponiveis. Aponte pontos de atencao, possiveis riscos e informacoes que devem ser "
+                "validadas por um profissional de saude. Nao prescreva medicamentos, doses ou condutas "
+                "definitivas."
+            )
+
+        if not cpf:
+            question = input("Pergunta: ").strip()
+            if question.lower() in {"sair", "exit", "quit"}:
+                break
+            if not question:
+                continue
+
+            context = input("Contexto (opcional, Enter para pular): ").strip()
+
+        resposta = ask(model, tokenizer, question, context, "", cpf)
         print(f"\nResposta:\n{resposta}\n")
 
 

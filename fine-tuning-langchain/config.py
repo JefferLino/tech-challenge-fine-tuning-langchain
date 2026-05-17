@@ -1,5 +1,6 @@
 # ─── Modelo ──────────────────────────────────────────────────────────────────
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+#MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 
 # ─── Diretórios ───────────────────────────────────────────────────────────────
 OUTPUT_DIR     = "./output"

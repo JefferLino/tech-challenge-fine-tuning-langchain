@@ -413,14 +413,7 @@ def ask_without_langgraph(model, tokenizer, question: str, context: str = "", so
                 source=source,
             )
         else:
-            final_answer = (
-                "Não foi possível gerar uma resposta aprovada pelos critérios de segurança e qualidade após "
-                "3 tentativas. Recomenda-se consultar um profissional de saúde qualificado para avaliar o caso.\n\n"
-                "Resumo:\n"
-                "- A resposta gerada não passou pela avaliação de segurança.\n"
-                "- Não foram exibidas orientações potencialmente inadequadas.\n"
-                "- O fluxo chegou ao limite de 3 avaliações sem aprovação."
-            )
+            final_answer = answer
     final_answer = add_explainability_to_answer(final_answer, context=context, source=source)
     log_explainability(
         service_name="final_answer",
@@ -429,12 +422,20 @@ def ask_without_langgraph(model, tokenizer, question: str, context: str = "", so
         context=context,
         trace_id=trace_id,
         source=source,
-        metadata={"status": "rejected", "last_verdict": verdict or "INDEFINIDO"},
+        metadata={
+            "status": "best_effort_unapproved",
+            "attempt": attempt_number,
+            "last_verdict": verdict or "INDEFINIDO",
+        },
     )
     log_audit_event(
         event="ask_finished",
         trace_id=trace_id,
-        metadata={"status": "rejected", "last_verdict": verdict or "INDEFINIDO"},
+        metadata={
+            "status": "best_effort_unapproved",
+            "attempt": attempt_number,
+            "last_verdict": verdict or "INDEFINIDO",
+        },
     )
     return final_answer
 
@@ -512,15 +513,8 @@ def approve_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
     return {**state, "final_answer": final_answer}
 
 
-def reject_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
-    final_answer = (
-        "NÃ£o foi possÃ­vel gerar uma resposta aprovada pelos critÃ©rios de seguranÃ§a e qualidade apÃ³s "
-        "3 tentativas. Recomenda-se consultar um profissional de saÃºde qualificado para avaliar o caso.\n\n"
-        "Resumo:\n"
-        "- A resposta gerada nÃ£o passou pela avaliaÃ§Ã£o de seguranÃ§a.\n"
-        "- NÃ£o foram exibidas orientaÃ§Ãµes potencialmente inadequadas.\n"
-        "- O fluxo chegou ao limite de 3 avaliaÃ§Ãµes sem aprovaÃ§Ã£o."
-    )
+def return_best_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
+    final_answer = state["answer"]
     final_answer = add_explainability_to_answer(
         final_answer,
         context=state["context"],
@@ -533,12 +527,20 @@ def reject_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
         context=state["context"],
         trace_id=state["trace_id"],
         source=state["source"],
-        metadata={"status": "rejected", "last_verdict": state["verdict"] or "INDEFINIDO"},
+        metadata={
+            "status": "best_effort_unapproved",
+            "attempt": state["attempt"],
+            "last_verdict": state["verdict"] or "INDEFINIDO",
+        },
     )
     log_audit_event(
         event="ask_finished",
         trace_id=state["trace_id"],
-        metadata={"status": "rejected", "last_verdict": state["verdict"] or "INDEFINIDO"},
+        metadata={
+            "status": "best_effort_unapproved",
+            "attempt": state["attempt"],
+            "last_verdict": state["verdict"] or "INDEFINIDO",
+        },
     )
     return {**state, "final_answer": final_answer}
 
@@ -547,7 +549,7 @@ def route_after_evaluation(state: MedicalAssistantState) -> str:
     if state["verdict"] == "APROVADO":
         return "approve"
     if state["attempt"] >= 3:
-        return "reject"
+        return "best_effort"
     return "revise"
 
 def route_prontuario(state: MedicalAssistantState) -> str:
@@ -576,7 +578,7 @@ def build_medical_assistant_graph():
     graph.add_node("evaluate_answer", evaluate_answer_node)
     graph.add_node("revise_answer", revise_answer_node)
     graph.add_node("approve_answer", approve_answer_node)
-    graph.add_node("reject_answer", reject_answer_node)
+    graph.add_node("return_best_answer", return_best_answer_node)
     graph.add_node("build_prontuario", build_prontuario)
 
     graph.set_conditional_entry_point(route_prontuario, {
@@ -591,12 +593,12 @@ def build_medical_assistant_graph():
         {
             "approve": "approve_answer",
             "revise": "revise_answer",
-            "reject": "reject_answer",
+            "best_effort": "return_best_answer",
         },
     )
     graph.add_edge("revise_answer", "evaluate_answer")
     graph.add_edge("approve_answer", END)
-    graph.add_edge("reject_answer", END)
+    graph.add_edge("return_best_answer", END)
 
     return graph.compile()
 

@@ -1,130 +1,131 @@
-# Fine-tuning LLaMA — Assistente Médico com PubMedQA
+# 🏥 Assistente Médico com Fine-Tuning QLoRA + LangChain
 
-Fine-tuning supervisionado (QLoRA) do **TinyLlama-1.1B** usando dados do PubMedQA para criar um assistente médico virtual. Roda 100% local em GPU NVIDIA, sem APIs pagas.
-
----
-
-## Estrutura do projeto
-
-```
-fine-tuning-langchain/
-├── data/
-│   ├── ori_pqal.json          # perguntas + contextos + respostas longas
-│   └── test_ground_truth.json # respostas yes/no/maybe por ID
-├── output/                    # adaptadores LoRA (gerado após treino)
-├── config.py                  # hiperparâmetros centralizados
-├── prepare_data.py            # pré-processamento e anonimização
-├── train.py                   # fine-tuning QLoRA
-├── inference.py               # chatbot interativo
-└── requirements.txt
-```
+Este projeto implementa um **Assistente Médico Virtual** baseado em fine-tuning supervisionado (**QLoRA**) do modelo **Qwen2.5-0.5B-Instruct** sobre dados biomédicos reais do **PubMedQA**, com fluxo de avaliação de segurança, integração com prontuários e rastreabilidade completa. Roda 100% local em GPU NVIDIA, sem APIs pagas.
 
 ---
 
-## Requisitos de hardware
+# 📂 Estrutura do Projeto
 
-| Componente | Mínimo recomendado |
-|------------|-------------------|
-| GPU NVIDIA | 6 GB VRAM (RTX 3060 / RTX 2070 ou superior) |
-| RAM        | 16 GB |
-| Armazenamento | ~10 GB livres |
+## config.py
+Hiperparâmetros centralizados:
+- Nome do modelo base
+- Parâmetros de treino (épocas, batch, learning rate)
+- Configuração dos adaptadores LoRA
+- Caminhos de entrada e saída
+
+## prepare_data.py
+Pipeline de preparação dos dados:
+- Leitura do dataset PubMedQA
+- Anonimização de datas, nomes e IDs
+- Truncagem de contextos longos
+- Formatação dos prompts de instrução
+- Geração do dataset de treino
+
+## train.py
+Fine-tuning com QLoRA:
+- Carregamento do modelo base em 4-bit (BitsAndBytes / NF4)
+- Injeção de adaptadores LoRA nas camadas de atenção
+- Treinamento supervisionado com SFTTrainer (TRL)
+- Salvamento dos adaptadores em `./output/`
+
+## inference.py
+Assistente médico com fluxo LangGraph:
+- Carregamento do modelo + adaptadores LoRA
+- Geração de resposta inicial
+- Avaliação automática de segurança
+- Revisão iterativa (até 3 tentativas)
+- Integração com prontuário do paciente via CPF
+
+## prontuario.py
+Integração com prontuários médicos:
+- Leitura de dados simulados em Excel
+- Busca por CPF
+- Formatação do histórico clínico como contexto para o modelo
+
+## logs.py
+Sistema de auditoria e explicabilidade:
+- Log de auditoria em JSON com trace_id
+- Log de explicabilidade com prompts, respostas, tokens e hashes
+- Rastreabilidade completa de cada interação
+
+## test.py
+Arquivo de testes:
+- Testa carregamento do modelo
+- Testa geração e avaliação de respostas
+- Testa integração com prontuários
 
 ---
 
-## Instalação
+# ⚙️ Dependências
+
+Instale com:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> **CUDA**: instale o PyTorch com suporte a CUDA compatível com seu driver.  
-> Consulte https://pytorch.org/get-started/locally/
+Principais bibliotecas:
+
+```
+torch>=2.1.0
+transformers>=4.36.0
+peft>=0.7.0
+trl>=0.7.4
+bitsandbytes>=0.41.3
+accelerate>=0.25.0
+langchain>=1.0.0
+langchain-huggingface>=1.0.0
+datasets>=2.16.0
+pandas
+openpyxl
+```
+
+> **CUDA**: instale o PyTorch com suporte a CUDA compatível com seu driver em https://pytorch.org/get-started/locally/
 
 ---
 
-## Passo a passo
+# 🚀 Como Executar
 
-### 1. Preparar os dados
-
-Coloque `ori_pqal.json` e `test_ground_truth.json` dentro da pasta `data/`.
-
+**1. Preparar os dados:**
 ```bash
 python prepare_data.py
 ```
 
-Gera `data/train_dataset.json` com prompts no formato TinyLlama-Chat.  
-O script também aplica anonimização básica (datas, nomes, IDs numéricos).
-
----
-
-### 2. Treinar o modelo
-
+**2. Treinar o modelo:**
 ```bash
 python train.py
 ```
 
-O que acontece internamente:
-- Carrega TinyLlama-1.1B em **4-bit** (QLoRA via BitsAndBytes)
-- Injeta adaptadores **LoRA** apenas nas camadas de atenção (`q_proj`, `v_proj`, `k_proj`, `o_proj`)
-- Treina por 3 épocas com batch efetivo de 8 (`BATCH_SIZE=2` × `GRAD_ACCUM=4`)
-- Salva os adaptadores em `./output/`
-
-**Somente ~0,5% dos parâmetros são treinados** — o restante permanece congelado.
-
----
-
-### 3. Usar o assistente
-
+**3. Executar o assistente:**
 ```bash
 python inference.py
 ```
 
-Exemplo de sessão:
+---
 
-```
-=== Assistente Médico (digite 'sair' para encerrar) ===
+# 📊 Funcionalidades
 
-Pergunta: Does metformin reduce cardiovascular risk in type 2 diabetes?
-Contexto (opcional, Enter para pular): Several RCTs showed...
-
-Resposta:
-YES
-
-Metformin has been shown to reduce cardiovascular events in overweight patients
-with type 2 diabetes according to the UKPDS trial...
-```
+- Fine-tuning eficiente com QLoRA (6 GB de VRAM)
+- Respostas baseadas em literatura biomédica real (PubMedQA)
+- Avaliação automática de segurança com até 3 revisões
+- Integração com prontuário médico do paciente via CPF
+- Fluxo de estados com LangGraph
+- Logs de auditoria e explicabilidade por interação
+- Rastreabilidade completa via trace_id
 
 ---
 
-## Configuração (`config.py`)
+# 🧠 Conceitos Principais
 
-| Parâmetro | Valor padrão | Descrição |
-|-----------|-------------|-----------|
-| `MODEL_NAME` | TinyLlama-1.1B-Chat-v1.0 | Modelo base (arquitetura LLaMA) |
-| `MAX_SEQ_LENGTH` | 1024 | Comprimento máximo da sequência |
-| `BATCH_SIZE` | 2 | Exemplos por passo de GPU |
-| `GRAD_ACCUM` | 4 | Acumulação de gradiente |
-| `EPOCHS` | 3 | Épocas de treino |
-| `LR` | 2e-4 | Taxa de aprendizado |
-| `LORA_R` | 16 | Rank das matrizes LoRA |
-| `LORA_ALPHA` | 32 | Escala LoRA |
+**QLoRA** combina duas técnicas para viabilizar fine-tuning em hardware de consumidor:
 
----
-
-## Conceitos principais
-
-**QLoRA** combina duas técnicas:
-
-1. **Quantização 4-bit (BitsAndBytes)**: reduz o modelo de ~2 GB (fp16) para ~700 MB na GPU, tornando possível rodar em GPUs de consumidor.
-
-2. **LoRA (Low-Rank Adaptation)**: ao invés de atualizar todos os pesos, injeta matrizes de baixo rank (`r=16`) nas camadas de atenção. Apenas ~8 milhões de parâmetros são treinados de um total de ~1,1 bilhão.
+- **Quantização 4-bit (BitsAndBytes / NF4):** reduz o modelo de ~2 GB para ~700 MB na GPU, com o modelo base completamente congelado.
+- **LoRA (Low-Rank Adaptation):** injeta matrizes de baixo rank (`r=16`) nas camadas de atenção. Apenas ~0,5% dos parâmetros são treinados.
 
 O resultado: fine-tuning que cabe em 6 GB de VRAM e treina em horas, não dias.
 
 ---
 
-## Modelo base
+# 📌 Resumo
 
-`TinyLlama/TinyLlama-1.1B-Chat-v1.0` — arquitetura LLaMA, completamente gratuito, sem necessidade de login no Hugging Face.
-
-Para usar `meta-llama/Llama-3.2-1B-Instruct` (opcional), aceite a licença em huggingface.co e faça `huggingface-cli login`.
+O projeto entrega um assistente médico inteligente treinado localmente, combinando fine-tuning eficiente com QLoRA, orquestração de fluxo com LangGraph e salvaguardas de segurança automáticas para garantir respostas clínicas responsáveis e rastreáveis.

@@ -7,16 +7,18 @@ Uso:
     python inference.py
 """
 
+import json
 from typing import Dict, Optional, TypedDict
 
 import torch
 from langchain_core.prompts import PromptTemplate
 from langchain_huggingface.llms import HuggingFacePipeline
+from langchain_ollama import ChatOllama
 from langgraph.graph import END, StateGraph
 from peft import PeftModel
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline as transformers_pipeline
 from prontuario import buscar_prontuario_por_cpf, montar_contexto_prontuario, cpf_existe_no_prontuario
-from config import MODEL_NAME, OUTPUT_DIR
+from config import EVALUATION_MODEL_NAME, MODEL_NAME, OLLAMA_BASE_URL, OUTPUT_DIR
 from logs import (
     add_explainability_to_answer,
     elapsed_seconds,
@@ -36,6 +38,7 @@ LANGCHAIN_PROMPT = PromptTemplate.from_template("{prompt}")
 class MedicalAssistantState(TypedDict):
     model: object
     tokenizer: object
+    evaluation_llm: object
     question: str
     context: str
     source: str
@@ -85,6 +88,40 @@ def load_model():
     )
 
     return model, tokenizer
+
+
+def load_evaluation_model():
+    setup_logging()
+    log_audit_event(
+        event="evaluation_model_load_started",
+        metadata={
+            "provider": "ollama",
+            "model_name": EVALUATION_MODEL_NAME,
+            "base_url": OLLAMA_BASE_URL,
+        },
+    )
+
+    print(f"[inference] Carregando avaliador Ollama '{EVALUATION_MODEL_NAME}'...")
+    evaluation_llm = ChatOllama(
+        model=EVALUATION_MODEL_NAME,
+        base_url=OLLAMA_BASE_URL,
+        temperature=0,
+        num_predict=160,
+        reasoning=False,
+        format="json",
+        validate_model_on_init=True,
+    )
+
+    log_audit_event(
+        event="evaluation_model_load_finished",
+        metadata={
+            "provider": "ollama",
+            "model_name": EVALUATION_MODEL_NAME,
+            "base_url": OLLAMA_BASE_URL,
+        },
+    )
+
+    return evaluation_llm
 
 
 def count_tokens(tokenizer, text: str, add_special_tokens: bool = True) -> int:
@@ -178,8 +215,7 @@ def call_initial_prompt(
     return answer
 
 def call_evaluation_prompt(
-    model,
-    tokenizer,
+    evaluation_llm,
     question: str,
     answer: str,
     context: str = "",
@@ -189,38 +225,41 @@ def call_evaluation_prompt(
 ) -> str:
     context_block = f"Contexto:\n{context}\n\n" if context.strip() else ""
 
-    prompt = (
-        "<|system|>\n"
+    system_prompt = (
         "Você é um avaliador de segurança e qualidade para respostas médicas. Avalie se a resposta "
         "está clara, objetiva, baseada no contexto/evidências e dentro dos limites de atuação de um "
         "assistente. Reprove respostas que prescrevam diretamente medicamentos, doses ou tratamentos, "
         "façam diagnóstico definitivo, ignorem sinais de urgência, extrapolem o contexto, omitam "
         "incertezas relevantes, deixem de recomendar validação humana quando necessário ou não "
         "contenham um resumo final em bullet list. Retorne obrigatoriamente um único parecer: "
-        "APROVADO ou REPROVADO. Não use o parecer oposto na "
-        "justificativa.\n"
-        "</s>\n"
-        "<|user|>\n"
+        "APROVADO ou REPROVADO. Não use o parecer oposto na justificativa. "
+        "Responda somente JSON válido, sem markdown, no formato "
+        '{"parecer":"APROVADO ou REPROVADO","justificativa":"máximo 20 palavras"}.'
+    )
+    user_prompt = (
         f"{context_block}"
         f"Pergunta: {question}\n\n"
         f"Resposta avaliada:\n{answer}\n\n"
-        "Formato obrigatório:\n"
-        "Parecer: <APROVADO|REPROVADO>\n"
-        "Justificativa: explique brevemente o motivo.\n"
-        "</s>\n"
-        "<|assistant|>\n"
+        "Retorne somente o JSON solicitado."
     )
+    prompt = f"System:\n{system_prompt}\n\nUser:\n{user_prompt}"
 
     generation_params = {
-        "max_new_tokens": 160,
-        "do_sample": False,
-        "pad_token_id": tokenizer.eos_token_id,
+        "format": "json",
+        "num_predict": 160,
+        "temperature": 0,
+        "reasoning": False,
     }
 
-    input_tokens = count_tokens(tokenizer, prompt)
     started_at = start_timer()
     try:
-        evaluation = generate_with_langchain(model, tokenizer, prompt, generation_params)
+        response = evaluation_llm.invoke(
+            [
+                ("system", system_prompt),
+                ("human", user_prompt),
+            ]
+        )
+        evaluation = normalize_evaluation_response(response.content)
     except Exception as error:
         log_service_error(
             service_name="evaluation_prompt",
@@ -228,12 +267,16 @@ def call_evaluation_prompt(
             error=error,
             context=context,
             trace_id=trace_id,
-            metadata={"attempt": attempt},
+            metadata={
+                "attempt": attempt,
+                "provider": "ollama",
+                "model_name": EVALUATION_MODEL_NAME,
+            },
             source=source,
         )
         raise
     duration = elapsed_seconds(started_at)
-    output_tokens = count_tokens(tokenizer, evaluation, add_special_tokens=False)
+    usage_metadata = getattr(response, "usage_metadata", None) or {}
     log_service_call(
         service_name="evaluation_prompt",
         question=question,
@@ -246,8 +289,11 @@ def call_evaluation_prompt(
         source=source,
         metadata={
             "attempt": attempt,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
+            "provider": "ollama",
+            "model_name": EVALUATION_MODEL_NAME,
+            "input_tokens": usage_metadata.get("input_tokens"),
+            "output_tokens": usage_metadata.get("output_tokens"),
+            "total_tokens": usage_metadata.get("total_tokens"),
         },
     )
     log_explainability(
@@ -257,10 +303,13 @@ def call_evaluation_prompt(
         context=context,
         trace_id=trace_id,
         source=source,
-        metadata={"attempt": attempt},
+        metadata={
+            "attempt": attempt,
+            "provider": "ollama",
+            "model_name": EVALUATION_MODEL_NAME,
+        },
     )
     return evaluation
-
 
 def call_revision_prompt(
     model,
@@ -346,7 +395,47 @@ def call_revision_prompt(
     return revised_answer
 
 
-def ask_without_langgraph(model, tokenizer, question: str, context: str = "", source: str = "") -> str:
+def normalize_evaluation_response(raw_response: str) -> str:
+    raw_response = (raw_response or "").strip()
+    try:
+        payload = json.loads(raw_response)
+    except json.JSONDecodeError:
+        return raw_response
+
+    parecer = str(payload.get("parecer", "")).strip().upper().replace("*", "")
+    if "REPROVADO" in parecer:
+        parecer = "REPROVADO"
+    elif "APROVADO" in parecer:
+        parecer = "APROVADO"
+
+    justificativa = str(payload.get("justificativa", "")).strip()
+    return (
+        f"Parecer: {parecer or 'INDEFINIDO'}\n"
+        f"Justificativa: {justificativa or 'Sem justificativa retornada.'}"
+    )
+
+
+def extract_evaluation_verdict(evaluation: str) -> str:
+    evaluation_lines = [line.strip().upper() for line in evaluation.splitlines() if line.strip()]
+    verdict_line = next((line for line in evaluation_lines if line.startswith("PARECER:")), "")
+    verdict = verdict_line.split(":", 1)[-1].strip().strip(".") if verdict_line else ""
+    verdict = verdict.replace("*", "").strip()
+
+    if "REPROVADO" in verdict:
+        return "REPROVADO"
+    if "APROVADO" in verdict:
+        return "APROVADO"
+    return verdict
+
+
+def ask_without_langgraph(
+    model,
+    tokenizer,
+    evaluation_llm,
+    question: str,
+    context: str = "",
+    source: str = "",
+) -> str:
     trace_id = new_trace_id()
     log_audit_event(
         event="ask_started",
@@ -361,8 +450,7 @@ def ask_without_langgraph(model, tokenizer, question: str, context: str = "", so
     for attempt in range(3):
         attempt_number = attempt + 1
         last_evaluation = call_evaluation_prompt(
-            model,
-            tokenizer,
+            evaluation_llm,
             question,
             answer,
             context,
@@ -370,12 +458,7 @@ def ask_without_langgraph(model, tokenizer, question: str, context: str = "", so
             attempt=attempt_number,
             source=source,
         )
-        evaluation_lines = [line.strip().upper() for line in last_evaluation.splitlines() if line.strip()]
-        print("==========")
-        print(evaluation_lines)
-        print("==========")
-        verdict_line = next((line for line in evaluation_lines if line.startswith("PARECER:")), "")
-        verdict = verdict_line.split(":", 1)[-1].strip().strip(".") if verdict_line else ""
+        verdict = extract_evaluation_verdict(last_evaluation)
         log_audit_event(
             event="evaluation_verdict",
             trace_id=trace_id,
@@ -454,8 +537,7 @@ def generate_initial_answer_node(state: MedicalAssistantState) -> MedicalAssista
 
 def evaluate_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
     evaluation = call_evaluation_prompt(
-        state["model"],
-        state["tokenizer"],
+        state["evaluation_llm"],
         state["question"],
         state["answer"],
         state["context"],
@@ -463,9 +545,7 @@ def evaluate_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
         attempt=state["attempt"],
         source=state["source"],
     )
-    evaluation_lines = [line.strip().upper() for line in evaluation.splitlines() if line.strip()]
-    verdict_line = next((line for line in evaluation_lines if line.startswith("PARECER:")), "")
-    verdict = verdict_line.split(":", 1)[-1].strip().strip(".") if verdict_line else ""
+    verdict = extract_evaluation_verdict(evaluation)
 
     log_audit_event(
         event="evaluation_verdict",
@@ -603,7 +683,15 @@ def build_medical_assistant_graph():
     return graph.compile()
 
 
-def ask(model, tokenizer, question: str, context: str = "", source: str = "", cpf = "") -> str:
+def ask(
+    model,
+    tokenizer,
+    evaluation_llm,
+    question: str,
+    context: str = "",
+    source: str = "",
+    cpf: str = "",
+) -> str:
     trace_id = new_trace_id()
     log_audit_event(
         event="ask_started",
@@ -618,6 +706,7 @@ def ask(model, tokenizer, question: str, context: str = "", source: str = "", cp
     initial_state: MedicalAssistantState = {
         "model": model,
         "tokenizer": tokenizer,
+        "evaluation_llm": evaluation_llm,
         "question": question,
         "context": context,
         "source": source,
@@ -635,6 +724,7 @@ def ask(model, tokenizer, question: str, context: str = "", source: str = "", cp
 
 def main():
     model, tokenizer = load_model()
+    evaluation_llm = load_evaluation_model()
 
     print("\n=== Assistente Médico (digite 'sair' para encerrar) ===\n")
     while True:
@@ -663,7 +753,7 @@ def main():
 
             context = input("Contexto (opcional, Enter para pular): ").strip()
 
-        resposta = ask(model, tokenizer, question, context, "", cpf)
+        resposta = ask(model, tokenizer, evaluation_llm, question, context, "", cpf)
         print(f"\nResposta:\n{resposta}\n")
 
 

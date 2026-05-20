@@ -1,6 +1,8 @@
 # ─── Modelo ──────────────────────────────────────────────────────────────────
 #MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+EVALUATION_MODEL_NAME = "qwen3:4b"
+OLLAMA_BASE_URL = "http://localhost:11434"
 
 # ─── Diretórios ───────────────────────────────────────────────────────────────
 OUTPUT_DIR     = "./output"

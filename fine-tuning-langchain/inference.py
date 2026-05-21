@@ -49,6 +49,7 @@ class MedicalAssistantState(TypedDict):
     attempt: int
     final_answer: str
     cpf: str
+    prontuario: str
 
 
 def build_bnb_config() -> BitsAndBytesConfig:
@@ -641,12 +642,10 @@ def route_prontuario(state: MedicalAssistantState) -> str:
 def build_prontuario(state: MedicalAssistantState) -> MedicalAssistantState:
     prontuario = buscar_prontuario_por_cpf(state["cpf"])
     contexto_prontuario = montar_contexto_prontuario(prontuario)
-    contextos = [contexto_prontuario, state["context"]]
-    context = "\n\n".join(contexto.strip() for contexto in contextos if contexto and contexto.strip())
 
     return {
         **state,
-        "context": context,
+        "prontuario": contexto_prontuario,
         "source": "base_mock_prontuarios.xlsx",
     }
 
@@ -719,7 +718,17 @@ def ask(
         "cpf" : cpf
     }
     final_state = app.invoke(initial_state)
-    return final_state["final_answer"]
+
+    final_answer = final_state["final_answer"]
+   
+
+    if "prontuario" in final_state:
+        prontuario = final_state["prontuario"]
+        final_answer = final_answer + "\n\nProntuário Médico:\n" + prontuario
+ 
+    
+
+    return final_answer
 
 
 def main():
@@ -737,24 +746,17 @@ def main():
             if (not existe_cpf):
                 print("Paciente não encontrado")
                 continue
-            question = (
-                "Analise o prontuario do paciente com base nos atendimentos, internacoes e alergias "
-                "disponiveis. Aponte pontos de atencao, possiveis riscos e informacoes que devem ser "
-                "validadas por um profissional de saude. Nao prescreva medicamentos, doses ou condutas "
-                "definitivas."
-            )
 
-        if not cpf:
-            question = input("Pergunta: ").strip()
-            if question.lower() in {"sair", "exit", "quit"}:
-                break
-            if not question:
-                continue
-
-            context = input("Contexto (opcional, Enter para pular): ").strip()
+        question = input("Pergunta: ").strip()
+        if question.lower() in {"sair", "exit", "quit"}:
+            break
+        if not question:
+            continue
+        
+        context = input("Contexto (opcional, Enter para pular): ").strip()
 
         resposta = ask(model, tokenizer, evaluation_llm, question, context, "", cpf)
-        print(f"\nResposta:\n{resposta}\n")
+        print(f"\n\n{resposta}\n")
 
 
 if __name__ == "__main__":

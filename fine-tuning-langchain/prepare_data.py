@@ -16,9 +16,10 @@ import re
 ORI_PATH   = "./data/ori_pqal.json"
 TRUTH_PATH = "./data/test_ground_truth.json"
 OUT_PATH   = "./data/train_dataset.json"
+CONTEXT_FILE = "./data/contexts/pubMedQA.json"
 
 # Número máximo de caracteres do contexto (evita ultrapassar MAX_SEQ_LENGTH)
-MAX_CONTEXT_CHARS = 1800
+MAX_CONTEXT_CHARS = 3000
 
 
 def anonymize(text: str) -> str:
@@ -40,21 +41,32 @@ def build_prompt(question: str, context: str, answer: str, long_answer: str) -> 
 
     return (
         "<|system|>\n"
-        "Você é um assistente médico especializado. Responda com base no contexto fornecido "
-        "de forma clara, objetiva e baseada em evidências.\n"
+        "You are a medical evidence classification assistant. "
+        "Answer only from the provided context. "
+        "Classify the main question as YES, NO, or MAYBE. "
+        "Base the label on the primary comparison or main outcome asked in the question. "
+        "Do not treat subgroup findings as the answer to the main question unless the context explicitly says so. "
+        "If a comparison is reported as not statistically significant, do not describe one group as better, worse, or more harmful. "
+        "The explanation must directly justify the label and must not add unrelated background findings. "
+        "Return exactly this format:\n"
+        "Answer: YES, NO, or MAYBE\n"
+        "Explanation: one short sentence that cites the key evidence for the label.\n"
         "</s>\n"
         "<|user|>\n"
-        f"Contexto:\n{context}\n\n"
-        f"Pergunta: {question}\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}\n"
         "</s>\n"
         "<|assistant|>\n"
-        f"Resposta: {answer}\n\n"
-        f"Explicação: {long_answer}\n"
+        f"Answer: {answer}\n\n"
+        f"Explanation: {long_answer}\n"
         "</s>"
     )
 
 
-def prepare(ori_path: str = ORI_PATH, truth_path: str = TRUTH_PATH, out_path: str = OUT_PATH):
+def prepare(ori_path: str = ORI_PATH, truth_path: str = TRUTH_PATH, out_path: str = OUT_PATH, context_file: str = CONTEXT_FILE):
+
+    contexts_file_data = []
+
     with open(ori_path, "r", encoding="utf-8") as f:
         ori_data: dict = json.load(f)
 
@@ -79,12 +91,18 @@ def prepare(ori_path: str = ORI_PATH, truth_path: str = TRUTH_PATH, out_path: st
         # Junta os parágrafos de contexto
         context = " ".join(contexts) if isinstance(contexts, list) else str(contexts)
 
+        contexts_file_data.append({ "Contexto": answer + "\n" + context })
+
         prompt = build_prompt(question, context, answer, long_answer)
         records.append({"text": prompt})
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
+
+    with open(context_file, "w", encoding="utf-8") as f:
+        json.dump(contexts_file_data, f, ensure_ascii=False, indent=2)
 
     print(f"[prepare_data] Total gerado : {len(records)}")
     print(f"[prepare_data] Ignorados    : {skipped}")

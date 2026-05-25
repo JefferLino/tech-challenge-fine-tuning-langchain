@@ -11,3 +11,5 @@ datasets>=2.16.0
 grandalf>=0.8
 pandas
 openpyxl
+sentence-transformers>=2.6.0
+pypdf>=4.0.0

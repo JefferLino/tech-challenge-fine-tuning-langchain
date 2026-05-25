@@ -1,6 +1,7 @@
 # ─── Modelo ──────────────────────────────────────────────────────────────────
 #MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+#MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 EVALUATION_MODEL_NAME = "qwen3:4b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 
@@ -21,4 +22,13 @@ LR         = 2e-4
 LORA_R          = 16
 LORA_ALPHA      = 32
 LORA_DROPOUT    = 0.05
-TARGET_MODULES  = ["q_proj", "v_proj", "k_proj", "o_proj"]
+
+TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+]

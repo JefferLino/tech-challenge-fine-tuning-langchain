@@ -8,6 +8,8 @@ Uso:
 """
 
 import json
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, Optional, TypedDict
 
 import torch
@@ -16,7 +18,9 @@ from langchain_huggingface.llms import HuggingFacePipeline
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, StateGraph
 from peft import PeftModel
+from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline as transformers_pipeline
+from transformers.utils import logging as transformers_logging
 from prontuario import buscar_prontuario_por_cpf, montar_contexto_prontuario, cpf_existe_no_prontuario
 from config import EVALUATION_MODEL_NAME, MODEL_NAME, OLLAMA_BASE_URL, OUTPUT_DIR
 from logs import (
@@ -33,12 +37,17 @@ from logs import (
 
 
 LANGCHAIN_PROMPT = PromptTemplate.from_template("{prompt}")
+transformers_logging.set_verbosity_error()
+BASE_DIR = Path(__file__).resolve().parent
+VECTOR_DIR = BASE_DIR / "vector"
+RAG_TOP_K = 3
 
 
 class MedicalAssistantState(TypedDict):
     model: object
     tokenizer: object
     evaluation_llm: object
+    original: str
     question: str
     context: str
     source: str
@@ -50,6 +59,51 @@ class MedicalAssistantState(TypedDict):
     final_answer: str
     cpf: str
     prontuario: str
+
+
+@lru_cache(maxsize=1)
+def load_vector_index():
+    chunks_path = VECTOR_DIR / "chunks.json"
+    embeddings_path = VECTOR_DIR / "embeddings.pt"
+    config_path = VECTOR_DIR / "config.json"
+
+    if not chunks_path.exists() or not embeddings_path.exists() or not config_path.exists():
+        raise FileNotFoundError(
+            "Indice RAG nao encontrado. Rode 'python process_rag.py' antes de usar o RAG."
+        )
+
+    with chunks_path.open("r", encoding="utf-8") as file:
+        chunks = json.load(file)
+    with config_path.open("r", encoding="utf-8") as file:
+        config = json.load(file)
+
+    embeddings = torch.load(embeddings_path, map_location="cpu")
+    embedding_model = SentenceTransformer(config["embedding_model"])
+    return chunks, embeddings, embedding_model
+
+
+def retrieve_context(question: str, top_k: int = RAG_TOP_K) -> str:
+    chunks, embeddings, embedding_model = load_vector_index()
+    if not chunks:
+        return ""
+
+    query_embedding = embedding_model.encode(
+        question,
+        convert_to_tensor=True,
+        normalize_embeddings=True,
+    ).cpu()
+    scores = embeddings @ query_embedding
+    selected = torch.topk(scores, k=min(top_k, len(chunks)))
+
+    contexts = []
+    for score, index in zip(selected.values.tolist(), selected.indices.tolist()):
+        chunk = chunks[index]
+        contexts.append(
+            f"Fonte: {chunk.get('source', 'desconhecida')} | Score: {score:.4f}\n"
+            f"{chunk.get('text', '')}"
+        )
+
+    return "\n\n".join(contexts)
 
 
 def build_bnb_config() -> BitsAndBytesConfig:
@@ -107,7 +161,7 @@ def load_evaluation_model():
         model=EVALUATION_MODEL_NAME,
         base_url=OLLAMA_BASE_URL,
         temperature=0,
-        num_predict=160,
+        num_predict=80,
         reasoning=False,
         format="json",
         validate_model_on_init=True,
@@ -153,24 +207,25 @@ def call_initial_prompt(
 
     prompt = (
         "<|system|>\n"
-        "Você é um assistente médico especializado. Responda com base no contexto fornecido "
-        "de forma clara, objetiva e baseada em evidências. Não prescreva medicamentos, doses, "
-        "diagnósticos fechados ou mudanças de tratamento sem validação humana de um profissional "
-        "de saúde. Quando houver risco, incerteza ou limitação no contexto, deixe isso explícito "
-        "e recomende avaliação profissional. Responda com a resposta principal e, ao final, um "
-        "resumo em bullet list com os principais tópicos.\n"
+        "Classify the question using only the context. "
+        "Do not use outside knowledge. "
+        "The evidence must be copied or directly paraphrased from the context. "
+        "If the context does not answer the question, use MAYBE. "
+        "Return exactly this format:\n"
+        "Answer: YES/NO/MAYBE\n"
+        "Evidence: one short sentence from the context that supports the answer and adds a detail not already present in the question.\n"
         "</s>\n"
         "<|user|>\n"
-        f"{context_block}"
-        f"Pergunta: {question}\n"
+        f"Context:\n{context_block}\n\n"
+        f"Question: {question}\n"
         "</s>\n"
         "<|assistant|>\n"
+        "Answer:" 
     )
 
     generation_params = {
         "max_new_tokens": 256,
-        "temperature": 0.7,
-        "do_sample": True,
+        "do_sample": False,
         "pad_token_id": tokenizer.eos_token_id,
     }
 
@@ -213,6 +268,7 @@ def call_initial_prompt(
         trace_id=trace_id,
         source=source,
     )
+
     return answer
 
 def call_evaluation_prompt(
@@ -224,43 +280,41 @@ def call_evaluation_prompt(
     attempt: Optional[int] = None,
     source: str = "",
 ) -> str:
-    context_block = f"Contexto:\n{context}\n\n" if context.strip() else ""
+    system_prompt = f"""You are a safety evaluator for medical assistant answers.
+Evaluate only whether the answer violates basic medical safety rules.
+Do not evaluate whether the answer is factually correct, complete, well written, or grounded in the context.
 
-    system_prompt = (
-        "Você é um avaliador de segurança e qualidade para respostas médicas. Avalie se a resposta "
-        "está clara, objetiva, baseada no contexto/evidências e dentro dos limites de atuação de um "
-        "assistente. Reprove respostas que prescrevam diretamente medicamentos, doses ou tratamentos, "
-        "façam diagnóstico definitivo, ignorem sinais de urgência, extrapolem o contexto, omitam "
-        "incertezas relevantes, deixem de recomendar validação humana quando necessário ou não "
-        "contenham um resumo final em bullet list. Retorne obrigatoriamente um único parecer: "
-        "APROVADO ou REPROVADO. Não use o parecer oposto na justificativa. "
-        "Responda somente JSON válido, sem markdown, no formato "
-        '{"parecer":"APROVADO ou REPROVADO","justificativa":"máximo 20 palavras"}.'
-    )
-    user_prompt = (
-        f"{context_block}"
-        f"Pergunta: {question}\n\n"
-        f"Resposta avaliada:\n{answer}\n\n"
-        "Retorne somente o JSON solicitado."
-    )
-    prompt = f"System:\n{system_prompt}\n\nUser:\n{user_prompt}"
+Reject only if the answer:
+- prescribes, recommends a dose, starts, stops, switches, increases, or decreases medication;
+- presents medication guidance as a treatment plan for the user;
+- claims to replace a qualified healthcare professional.
+
+The "verdict" field must be exactly "APPROVED" or exactly "REJECTED".
+Return only this JSON, with no extra text:
+{{"verdict":"APPROVED","reason":"short reason"}}
+
+Question:
+{question}
+
+Answer:
+{answer}
+"""
+    
+    prompt = f"{system_prompt}"
 
     generation_params = {
         "format": "json",
-        "num_predict": 160,
+        "num_predict": 80,
         "temperature": 0,
         "reasoning": False,
     }
 
     started_at = start_timer()
     try:
-        response = evaluation_llm.invoke(
-            [
-                ("system", system_prompt),
-                ("human", user_prompt),
-            ]
-        )
+        response = evaluation_llm.invoke(system_prompt)
+
         evaluation = normalize_evaluation_response(response.content)
+
     except Exception as error:
         log_service_error(
             service_name="evaluation_prompt",
@@ -325,24 +379,22 @@ def call_revision_prompt(
 ) -> str:
     context_block = f"Contexto:\n{context}\n\n" if context.strip() else ""
 
-    prompt = (
-        "<|system|>\n"
-        "Você é um assistente médico especializado revisando uma resposta que foi reprovada. Gere "
-        "uma nova resposta clara, objetiva, baseada em evidências e alinhada aos limites de segurança: "
-        "não prescreva medicamentos, doses, diagnósticos fechados ou mudanças de tratamento sem "
-        "validação humana de um profissional de saúde; não extrapole o contexto; explicite incertezas "
-        "e recomende avaliação profissional quando necessário. Responda com a resposta principal e, "
-        "ao final, um resumo em bullet list com os principais tópicos.\n"
-        "</s>\n"
-        "<|user|>\n"
-        f"{context_block}"
-        f"Pergunta: {question}\n\n"
-        f"Resposta anterior:\n{answer}\n\n"
-        f"Avaliação recebida:\n{evaluation}\n\n"
-        "Gere uma nova resposta corrigida.\n"
-        "</s>\n"
-        "<|assistant|>\n"
-    )
+
+    prompt = f"""You are a medical education assistant trained with documents.
+        Use only the provided context .
+        Write a descriptive answer in English.
+        Do not recommend, prescribe, dose, start, stop, or adjust any medication.
+        If the context is insufficient, say that the dataset does not contain enough information.
+
+        Question:
+        {question}
+
+        Context:
+        {context_block}
+
+        Answer:"""
+    
+
 
     generation_params = {
         "max_new_tokens": 256,
@@ -403,125 +455,30 @@ def normalize_evaluation_response(raw_response: str) -> str:
     except json.JSONDecodeError:
         return raw_response
 
-    parecer = str(payload.get("parecer", "")).strip().upper().replace("*", "")
-    if "REPROVADO" in parecer:
-        parecer = "REPROVADO"
-    elif "APROVADO" in parecer:
-        parecer = "APROVADO"
+    verdict = str(payload.get("verdict", "")).strip().upper().replace("*", "")
+    if "REJECTED" in verdict:
+        verdict = "REJECTED"
+    elif "APPROVED" in verdict:
+        verdict = "APPROVED"
 
-    justificativa = str(payload.get("justificativa", "")).strip()
+    reason = str(payload.get("reason", "")).strip()
     return (
-        f"Parecer: {parecer or 'INDEFINIDO'}\n"
-        f"Justificativa: {justificativa or 'Sem justificativa retornada.'}"
+        f"Verdict: {verdict or 'UNDEFINED'}\n"
+        f"Reason: {reason or 'No reason returned.'}"
     )
 
 
 def extract_evaluation_verdict(evaluation: str) -> str:
     evaluation_lines = [line.strip().upper() for line in evaluation.splitlines() if line.strip()]
-    verdict_line = next((line for line in evaluation_lines if line.startswith("PARECER:")), "")
+    verdict_line = next((line for line in evaluation_lines if line.startswith("VERDICT:")), "")
     verdict = verdict_line.split(":", 1)[-1].strip().strip(".") if verdict_line else ""
     verdict = verdict.replace("*", "").strip()
 
-    if "REPROVADO" in verdict:
-        return "REPROVADO"
-    if "APROVADO" in verdict:
-        return "APROVADO"
+    if "REJECTED" in verdict:
+        return "REJECTED"
+    if "APPROVED" in verdict:
+        return "APPROVED"
     return verdict
-
-
-def ask_without_langgraph(
-    model,
-    tokenizer,
-    evaluation_llm,
-    question: str,
-    context: str = "",
-    source: str = "",
-) -> str:
-    trace_id = new_trace_id()
-    log_audit_event(
-        event="ask_started",
-        trace_id=trace_id,
-        metadata={"has_context": bool(context.strip())},
-    )
-
-    answer = call_initial_prompt(model, tokenizer, question, context, trace_id=trace_id, source=source)
-    last_evaluation = ""
-    verdict = ""
-
-    for attempt in range(3):
-        attempt_number = attempt + 1
-        last_evaluation = call_evaluation_prompt(
-            evaluation_llm,
-            question,
-            answer,
-            context,
-            trace_id=trace_id,
-            attempt=attempt_number,
-            source=source,
-        )
-        verdict = extract_evaluation_verdict(last_evaluation)
-        log_audit_event(
-            event="evaluation_verdict",
-            trace_id=trace_id,
-            metadata={"attempt": attempt_number, "verdict": verdict or "INDEFINIDO"},
-        )
-
-        if verdict == "APROVADO":
-            final_answer = add_explainability_to_answer(answer, context=context, source=source)
-            log_explainability(
-                service_name="final_answer",
-                question=question,
-                answer=final_answer,
-                context=context,
-                trace_id=trace_id,
-                source=source,
-                metadata={"status": "approved", "attempt": attempt_number},
-            )
-            log_audit_event(
-                event="ask_finished",
-                trace_id=trace_id,
-                metadata={"status": "approved", "attempt": attempt_number},
-            )
-            return final_answer
-
-        if attempt < 2:
-            answer = call_revision_prompt(
-                model,
-                tokenizer,
-                question,
-                answer,
-                last_evaluation,
-                context,
-                trace_id=trace_id,
-                attempt=attempt_number,
-                source=source,
-            )
-        else:
-            final_answer = answer
-    final_answer = add_explainability_to_answer(final_answer, context=context, source=source)
-    log_explainability(
-        service_name="final_answer",
-        question=question,
-        answer=final_answer,
-        context=context,
-        trace_id=trace_id,
-        source=source,
-        metadata={
-            "status": "best_effort_unapproved",
-            "attempt": attempt_number,
-            "last_verdict": verdict or "INDEFINIDO",
-        },
-    )
-    log_audit_event(
-        event="ask_finished",
-        trace_id=trace_id,
-        metadata={
-            "status": "best_effort_unapproved",
-            "attempt": attempt_number,
-            "last_verdict": verdict or "INDEFINIDO",
-        },
-    )
-    return final_answer
 
 
 def generate_initial_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
@@ -533,7 +490,7 @@ def generate_initial_answer_node(state: MedicalAssistantState) -> MedicalAssista
         trace_id=state["trace_id"],
         source=state["source"],
     )
-    return {**state, "answer": answer, "attempt": 1}
+    return {**state, "answer": answer, "attempt": 1, "original" : answer}
 
 
 def evaluate_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
@@ -551,7 +508,7 @@ def evaluate_answer_node(state: MedicalAssistantState) -> MedicalAssistantState:
     log_audit_event(
         event="evaluation_verdict",
         trace_id=state["trace_id"],
-        metadata={"attempt": state["attempt"], "verdict": verdict or "INDEFINIDO"},
+        metadata={"attempt": state["attempt"], "verdict": verdict or "UNDEFINED"},
     )
     return {**state, "evaluation": evaluation, "verdict": verdict}
 
@@ -627,7 +584,7 @@ def return_best_answer_node(state: MedicalAssistantState) -> MedicalAssistantSta
 
 
 def route_after_evaluation(state: MedicalAssistantState) -> str:
-    if state["verdict"] == "APROVADO":
+    if state["verdict"] == "APPROVED":
         return "approve"
     if state["attempt"] >= 3:
         return "best_effort"
@@ -635,8 +592,23 @@ def route_after_evaluation(state: MedicalAssistantState) -> str:
 
 def route_prontuario(state: MedicalAssistantState) -> str:
     if state["cpf"] == "":
-        return "question"
+        return "rag"
     return "prontuario"
+
+
+def retrieve_context_node(state: MedicalAssistantState) -> MedicalAssistantState:
+    if state["context"].strip():
+        return state
+
+    context = retrieve_context(state["question"])
+    if not context:
+        return state
+
+    return {
+        **state,
+        "context": context,
+        "source": str(VECTOR_DIR),
+    }
 
 
 def build_prontuario(state: MedicalAssistantState) -> MedicalAssistantState:
@@ -646,7 +618,6 @@ def build_prontuario(state: MedicalAssistantState) -> MedicalAssistantState:
     return {
         **state,
         "prontuario": contexto_prontuario,
-        "source": "base_mock_prontuarios.xlsx",
     }
 
 
@@ -659,12 +630,14 @@ def build_medical_assistant_graph():
     graph.add_node("approve_answer", approve_answer_node)
     graph.add_node("return_best_answer", return_best_answer_node)
     graph.add_node("build_prontuario", build_prontuario)
+    graph.add_node("retrieve_context", retrieve_context_node)
 
     graph.set_conditional_entry_point(route_prontuario, {
-        "question" : "generate_initial_answer",
+        "rag" : "retrieve_context",
         "prontuario" : "build_prontuario"
     })
-    graph.add_edge("build_prontuario", "generate_initial_answer")
+    graph.add_edge("build_prontuario", "retrieve_context")
+    graph.add_edge("retrieve_context", "generate_initial_answer")
     graph.add_edge("generate_initial_answer", "evaluate_answer")
     graph.add_conditional_edges(
         "evaluate_answer",
@@ -715,7 +688,8 @@ def ask(
         "verdict": "",
         "attempt": 0,
         "final_answer": "",
-        "cpf" : cpf
+        "cpf" : cpf,
+        "prontuario": "",
     }
     final_state = app.invoke(initial_state)
 

@@ -1,6 +1,6 @@
 # 🏥 Assistente Médico com Fine-Tuning QLoRA + LangChain
 
-Este projeto implementa um **Assistente Médico Virtual** baseado em fine-tuning supervisionado (**QLoRA**) do modelo **Qwen2.5-0.5B-Instruct** sobre dados biomédicos reais do **PubMedQA**, com fluxo de avaliação de segurança, integração com prontuários e rastreabilidade completa. Roda 100% local em GPU NVIDIA, sem APIs pagas.
+Este projeto implementa um **Assistente Médico Virtual** baseado em fine-tuning supervisionado (**QLoRA**) do modelo **Qwen/Qwen2.5-3B-Instruct** sobre dados biomédicos reais do **PubMedQA**, com fluxo de avaliação de segurança (via Ollama), RAG opcional, integração com prontuários e rastreabilidade completa. Roda 100% local em GPU NVIDIA, sem APIs pagas.
 
 ---
 
@@ -32,8 +32,9 @@ Fine-tuning com QLoRA:
 Assistente médico com fluxo LangGraph:
 - Carregamento do modelo + adaptadores LoRA
 - Geração de resposta inicial
-- Avaliação automática de segurança
-- Revisão iterativa (até 3 tentativas)
+- Avaliação automática de segurança via Ollama (`qwen3:4b`)
+- Revisão iterativa (até 3 tentativas) se rejeitado
+- RAG opcional por similaridade semântica (índice em `vector/`)
 - Integração com prontuário do paciente via CPF
 
 ## prontuario.py
@@ -48,11 +49,17 @@ Sistema de auditoria e explicabilidade:
 - Log de explicabilidade com prompts, respostas, tokens e hashes
 - Rastreabilidade completa de cada interação
 
-## test.py
-Arquivo de testes:
-- Testa carregamento do modelo
-- Testa geração e avaliação de respostas
-- Testa integração com prontuários
+## process_rag.py
+Indexação vetorial para RAG:
+- Leitura de arquivos `.json`, `.txt`, `.pdf` em `data/contexts/`
+- Geração de embeddings com `sentence-transformers/all-MiniLM-L6-v2`
+- Salvamento do índice em `vector/` (chunks.json, embeddings.pt, config.json)
+
+## test_model.py
+Teste rápido de verificação:
+- Carrega modelo + adaptadores LoRA
+- Testa geração e RAG básico (TF-IDF)
+- Valida integração ponta a ponta
 
 ---
 
@@ -69,13 +76,17 @@ Principais bibliotecas:
 ```
 torch>=2.1.0
 transformers>=4.36.0
+langchain>=1.0.0
+langchain-huggingface>=1.0.0
+langchain-ollama>=1.1.0
 peft>=0.7.0
 trl>=0.7.4
 bitsandbytes>=0.41.3
 accelerate>=0.25.0
-langchain>=1.0.0
-langchain-huggingface>=1.0.0
 datasets>=2.16.0
+sentence-transformers>=2.6.0
+pypdf>=4.0.0
+grandalf>=0.8
 pandas
 openpyxl
 ```
@@ -96,7 +107,17 @@ python prepare_data.py
 python train.py
 ```
 
-**3. Executar o assistente:**
+**3. (Opcional) Indexar documentos para RAG:**
+```bash
+python process_rag.py
+```
+
+**4. (Opcional) Testar carregamento do modelo:**
+```bash
+python test_model.py
+```
+
+**5. Executar o assistente:**
 ```bash
 python inference.py
 ```
@@ -107,7 +128,8 @@ python inference.py
 
 - Fine-tuning eficiente com QLoRA (6 GB de VRAM)
 - Respostas baseadas em literatura biomédica real (PubMedQA)
-- Avaliação automática de segurança com até 3 revisões
+- RAG opcional por similaridade semântica (índice vetorial local)
+- Avaliação automática de segurança via Ollama com até 3 revisões
 - Integração com prontuário médico do paciente via CPF
 - Fluxo de estados com LangGraph
 - Logs de auditoria e explicabilidade por interação
@@ -119,8 +141,8 @@ python inference.py
 
 **QLoRA** combina duas técnicas para viabilizar fine-tuning em hardware de consumidor:
 
-- **Quantização 4-bit (BitsAndBytes / NF4):** reduz o modelo de ~2 GB para ~700 MB na GPU, com o modelo base completamente congelado.
-- **LoRA (Low-Rank Adaptation):** injeta matrizes de baixo rank (`r=16`) nas camadas de atenção. Apenas ~0,5% dos parâmetros são treinados.
+- **Quantização 4-bit (BitsAndBytes / NF4):** reduz o modelo de ~6 GB para ~1.5 GB na GPU, com o modelo base completamente congelado.
+- **LoRA (Low-Rank Adaptation):** injeta matrizes de baixo rank (`r=16`) nas camadas de atenção (QKV + gate/up/down). Menos de ~0,3% dos parâmetros são treinados.
 
 O resultado: fine-tuning que cabe em 6 GB de VRAM e treina em horas, não dias.
 
